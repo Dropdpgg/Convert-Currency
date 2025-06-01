@@ -167,7 +167,7 @@ def generate_exchange_chart(from_curr, to_curr):
     plt.ylabel(f'Курс {from_curr} к {to_curr}', fontsize=12)
     plt.grid(True, linestyle='--', alpha=0.7)
 
-    date_labels = [date.strftime('%d.%m') for date in dates]
+    date_labels = [date.strftime('%d-%m-%Y') for date in dates]  
     plt.xticks(dates, date_labels, rotation=15)
 
     if rates[0] != 0:
