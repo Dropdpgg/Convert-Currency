@@ -13,6 +13,7 @@ import random
 import numpy as np 
 from bank_parsers import get_bank_rates
 import pandas as pd
+from collections import defaultdict
 
 app = Flask(__name__)
 
@@ -39,6 +40,7 @@ CURRENCY_NAMES = {
 
 exchange_rates_cache = {'rates': {}, 'timestamp': 0}
 historical_cache = {}
+usd_cross_cache = defaultdict(dict)
 
 def fetch_exchange_rates():
     if time.time() - exchange_rates_cache['timestamp'] < 1800 and exchange_rates_cache['rates']:
@@ -71,70 +73,96 @@ def fetch_exchange_rates():
 
     return exchange_rates_cache['rates']
 
-def fetch_historical_range(from_curr, to_curr, days=7):
-
-    cache_key = f"{from_curr}_{to_curr}_{days}"
-
-    if cache_key in historical_cache:
-        cached_data = historical_cache[cache_key]
-        if time.time() - cached_data['timestamp'] < 3600:
-            return cached_data['rates'], cached_data['dates']
-    
+def fetch_direct_historical_range(from_curr, to_curr, days=7):
     try:
         params = {
             'function': 'FX_DAILY',
             'from_symbol': from_curr,
             'to_symbol': to_curr,
             'apikey': ALPHA_VANTAGE_KEY,
-            'outputsize': 'compact',
+            'outputsize': 'compact' if days <= 100 else 'full',
             'datatype': 'json'
         }
         
         response = requests.get(ALPHA_VANTAGE_URL, params=params)
         data = response.json()
         
+        if 'Note' in data:
+            print(f"API Limit: {data['Note']}")
+            return None, None
+            
         if 'Time Series FX (Daily)' in data:
             series = data['Time Series FX (Daily)']
-
-            all_dates = sorted(series.keys(), reverse=True)
-            selected_dates = all_dates[:days]
+            sorted_dates = sorted(series.keys(), reverse=True)[:days]
             
             dates = []
             rates = []
             
-            for date_str in selected_dates:
+            for date_str in sorted_dates:
                 date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
                 dates.append(date_obj)
                 rates.append(float(series[date_str]['4. close']))
-
-            current_rate = exchange_rates_cache['rates'].get(from_curr, {}).get(to_curr)
-            today = datetime.now().date()
-
-            if dates and dates[0] != today and current_rate:
-                dates.insert(0, today)
-                rates.insert(0, current_rate)
-
-            cache_entry = {
-                'rates': rates,
-                'dates': dates,
-                'timestamp': time.time()
-            }
-            historical_cache[cache_key] = cache_entry
+                
             return rates, dates
 
-        print(f"API Error: {data.get('Note', data.get('Information', 'Unknown error'))}")
+        print(f"API Error: {data.get('Information', 'Unknown error')}")
+        return None, None
         
     except Exception as e:
-        print(f"Ошибка при получении исторических данных: {e}")
+        print(f"Direct historical error {from_curr}/{to_curr}: {e}")
+        return None, None
+
+def fetch_historical_range(from_curr, to_curr, days=7):
+    cache_key = f"{from_curr}_{to_curr}_{days}"
+    
+    if cache_key in historical_cache:
+        cached_data = historical_cache[cache_key]
+        if time.time() - cached_data['timestamp'] < 3600:
+            return cached_data['rates'], cached_data['dates']
+
+    rates, dates = fetch_direct_historical_range(from_curr, to_curr, days)
+
+    if rates is None and from_curr != 'USD' and to_curr != 'USD':
+        usd_rates1, usd_dates1 = fetch_historical_range(from_curr, 'USD', days)
+        usd_rates2, usd_dates2 = fetch_historical_range(to_curr, 'USD', days)
+        
+        if usd_rates1 and usd_rates2:
+            dict1 = dict(zip(usd_dates1, usd_rates1))
+            dict2 = dict(zip(usd_dates2, usd_rates2))
+            common_dates = sorted(set(usd_dates1) & set(usd_dates2), reverse=True)[:days]
+            
+            if common_dates:
+                rates = []
+                dates = common_dates
+                for date in common_dates:
+                    cross_rate = dict1[date] / dict2[date]
+                    rates.append(cross_rate)
+
+    if rates is not None:
+        current_rate = exchange_rates_cache['rates'].get(from_curr, {}).get(to_curr)
+        today = datetime.now().date()
+        
+        if current_rate and (not dates or dates[0] != today):
+            dates.insert(0, today)
+            rates.insert(0, current_rate)
+            if len(dates) > days:
+                dates = dates[:days]
+                rates = rates[:days]
+
+    if rates is not None:
+        historical_cache[cache_key] = {
+            'rates': rates,
+            'dates': dates,
+            'timestamp': time.time()
+        }
+        return rates, dates
     
     return None, None
 
 def generate_exchange_chart(from_curr, to_curr):
-
-    result = fetch_historical_range(from_curr, to_curr, days=7)
+    rates, dates = fetch_historical_range(from_curr, to_curr, days=7)
     
-    if result and result[0] is not None and result[1] is not None:
-        rates, dates = result
+    if rates and dates:
         chart_title = f'Динамика курса {from_curr}/{to_curr} за 7 дней'
     else:
         base_rate = exchange_rates_cache['rates'].get(from_curr, {}).get(to_curr, 1.0)
@@ -150,10 +178,8 @@ def generate_exchange_chart(from_curr, to_curr):
         chart_title = f'Имитация курса {from_curr}/{to_curr} (реальные данные недоступны)'
 
     plt.figure(figsize=(10, 6))
-
     plt.plot(dates, rates, marker='o', linestyle='-', color='#1F2261', 
              markersize=6, linewidth=2.5, markerfacecolor='white', markeredgewidth=1.5)
-
     plt.fill_between(dates, rates, min(rates)*0.99, color='#1F2261', alpha=0.1)
 
     if len(rates) > 1:
