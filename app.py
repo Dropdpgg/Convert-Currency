@@ -19,17 +19,14 @@ from mysql.connector import Error
 
 app = Flask(__name__)
 
-def get_mysql_config():
-    return {
-        'user': os.getenv('MYSQL_USER', 'andrey'),
-        'password': os.getenv('MYSQL_PASSWORD', 'zxc555ewq'),
-        'host': os.getenv('MYSQL_HOST', 'localhost'),
-        'database': os.getenv('MYSQL_DATABASE', 'currency_app'),
-        'port': int(os.getenv('MYSQL_PORT', '3306')),
-        'ssl_disabled': True 
-    }
-
-
+MYSQL_CONFIG = {
+    'user': os.getenv('MYSQL_USER', 'andrey'),
+    'password': os.getenv('MYSQL_PASSWORD', 'zxc555ewq'),
+    'host': os.getenv('MYSQL_HOST', 'localhost'),
+    'database': os.getenv('MYSQL_DATABASE', 'currency_app'),
+    'port': os.getenv('MYSQL_PORT', 3306),
+    'ssl_disabled': True
+}
 
 ALPHA_VANTAGE_KEY = os.environ.get('ALPHA_VANTAGE_KEY', 'JDAB60C0396F3IRG')
 ALPHA_VANTAGE_URL = 'https://www.alphavantage.co/query'
@@ -58,7 +55,7 @@ usd_cross_cache = defaultdict(dict)
 
 def create_connection():
     try:
-        connection = mysql.connector.connect(get_mysql_config())
+        connection = mysql.connector.connect(**MYSQL_CONFIG)
         return connection
     except Error as e:
         print(f"Ошибка подключения к MySQL: {e}")
