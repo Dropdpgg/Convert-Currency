@@ -14,8 +14,18 @@ import numpy as np
 from bank_parsers import get_bank_rates
 import pandas as pd
 from collections import defaultdict
+import mysql.connector
+from mysql.connector import Error
 
 app = Flask(__name__)
+
+MYSQL_CONFIG = {
+    'user': os.getenv('MYSQL_USER', 'andrey'),
+    'password': os.getenv('MYSQL_PASSWORD', 'zxc555ewq'),
+    'host': os.getenv('MYSQL_HOST', 'localhost'),
+    'database': os.getenv('MYSQL_DATABASE', 'currency_app'),
+    'port': os.getenv('MYSQL_PORT', 3306)
+}
 
 ALPHA_VANTAGE_KEY = os.environ.get('ALPHA_VANTAGE_KEY', 'JDAB60C0396F3IRG')
 ALPHA_VANTAGE_URL = 'https://www.alphavantage.co/query'
@@ -42,10 +52,271 @@ exchange_rates_cache = {'rates': {}, 'timestamp': 0}
 historical_cache = {}
 usd_cross_cache = defaultdict(dict)
 
-def fetch_exchange_rates():
-    if time.time() - exchange_rates_cache['timestamp'] < 1800 and exchange_rates_cache['rates']:
-        return exchange_rates_cache['rates']
+def create_connection():
+    try:
+        connection = mysql.connector.connect(**MYSQL_CONFIG)
+        return connection
+    except Error as e:
+        print(f"Ошибка подключения к MySQL: {e}")
+        return None
+
+def init_database():
+    connection = create_connection()
+    if connection is None:
+        return
     
+    try:
+        cursor = connection.cursor()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS exchange_rates (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            from_currency VARCHAR(3) NOT NULL,
+            to_currency VARCHAR(3) NOT NULL,
+            rate FLOAT NOT NULL,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY (from_currency, to_currency)
+        )
+        """)
+        
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS historical_rates (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            from_currency VARCHAR(3) NOT NULL,
+            to_currency VARCHAR(3) NOT NULL,
+            date DATE NOT NULL,
+            rate FLOAT NOT NULL,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY (from_currency, to_currency, date)
+        )
+        """)
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bank_rates (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            bank_name VARCHAR(100) NOT NULL,
+            currency VARCHAR(3) NOT NULL,
+            buy_rate FLOAT NOT NULL,
+            sell_rate FLOAT NOT NULL,
+            updated DATETIME NOT NULL,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY (bank_name, currency)
+        )
+        """)
+        
+        connection.commit()
+        print("Таблицы успешно созданы")
+        
+    except Error as e:
+        print(f"Ошибка при создании таблиц: {e}")
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
+
+def save_exchange_rates_to_db(rates):
+    connection = create_connection()
+    if connection is None:
+        return
+    
+    try:
+        cursor = connection.cursor()
+        cursor.execute("DELETE FROM exchange_rates")
+
+        for from_curr, to_currencies in rates.items():
+            for to_curr, rate in to_currencies.items():
+                cursor.execute("""
+                INSERT INTO exchange_rates (from_currency, to_currency, rate)
+                VALUES (%s, %s, %s)
+                """, (from_curr, to_curr, rate))
+        
+        connection.commit()
+        print("Курсы валют сохранены в БД")
+        
+    except Error as e:
+        print(f"Ошибка сохранения курсов в БД: {e}")
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
+
+def get_exchange_rates_from_db():
+    connection = create_connection()
+    if connection is None:
+        return None
+    
+    try:
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute("SELECT from_currency, to_currency, rate FROM exchange_rates")
+        rows = cursor.fetchall()
+        
+        if not rows:
+            return None
+        
+        rates = {}
+        for row in rows:
+            if row['from_currency'] not in rates:
+                rates[row['from_currency']] = {}
+            rates[row['from_currency']][row['to_currency']] = row['rate']
+        
+        return rates
+        
+    except Error as e:
+        print(f"Ошибка получения курсов из БД: {e}")
+        return None
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
+
+def save_historical_rates_to_db(from_curr, to_curr, rates, dates):
+    connection = create_connection()
+    if connection is None:
+        return
+    
+    try:
+        cursor = connection.cursor()
+        cursor.execute("""
+        DELETE FROM historical_rates 
+        WHERE from_currency = %s AND to_currency = %s
+        """, (from_curr, to_curr))
+
+        for date, rate in zip(dates, rates):
+            cursor.execute("""
+            INSERT INTO historical_rates (from_currency, to_currency, date, rate)
+            VALUES (%s, %s, %s, %s)
+            """, (from_curr, to_curr, date, rate))
+        
+        connection.commit()
+        print(f"Исторические данные для {from_curr}/{to_curr} сохранены в БД")
+        
+    except Error as e:
+        print(f"Ошибка сохранения исторических данных в БД: {e}")
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
+
+def get_historical_rates_from_db(from_curr, to_curr, days=7):
+    connection = create_connection()
+    if connection is None:
+        return None, None
+    
+    try:
+        cursor = connection.cursor()
+        cursor.execute("""
+        SELECT date, rate 
+        FROM historical_rates 
+        WHERE from_currency = %s AND to_currency = %s 
+        ORDER BY date DESC 
+        LIMIT %s
+        """, (from_curr, to_curr, days))
+        
+        rows = cursor.fetchall()
+        
+        if not rows:
+            return None, None
+        
+        dates = []
+        rates = []
+        for row in rows:
+            dates.append(row[0])
+            rates.append(row[1])
+        
+        return rates, dates
+        
+    except Error as e:
+        print(f"Ошибка получения исторических данных из БД: {e}")
+        return None, None
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
+
+def save_bank_rates_to_db(bank_rates):
+    connection = create_connection()
+    if connection is None:
+        return
+    
+    try:
+        cursor = connection.cursor()
+        
+        for bank in bank_rates:
+            cursor.execute("""
+            INSERT INTO bank_rates (bank_name, currency, buy_rate, sell_rate, updated)
+            VALUES (%s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE 
+                buy_rate = VALUES(buy_rate),
+                sell_rate = VALUES(sell_rate),
+                updated = VALUES(updated)
+            """, (
+                bank['name'], 
+                bank['currency'], 
+                bank['buy'], 
+                bank['sell'], 
+                bank['updated']
+            ))
+        
+        connection.commit()
+        print("Банковские курсы сохранены в БД")
+        
+    except Error as e:
+        print(f"Ошибка сохранения банковских курсов в БД: {e}")
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
+
+def get_bank_rates_from_db(currency):
+    connection = create_connection()
+    if connection is None:
+        return None
+    
+    try:
+        cursor = connection.cursor(dictionary=True)
+        
+        cursor.execute("""
+        SELECT bank_name, currency, buy_rate, sell_rate, updated 
+        FROM bank_rates 
+        WHERE currency = %s 
+          AND timestamp >= NOW() - INTERVAL 1 HOUR
+        """, (currency,))
+        
+        rows = cursor.fetchall()
+        
+        if not rows:
+            return None
+        
+        bank_rates = []
+        for row in rows:
+            bank_rates.append({
+                'name': row['bank_name'],
+                'currency': row['currency'],
+                'buy': row['buy_rate'],
+                'sell': row['sell_rate'],
+                'updated': row['updated'].strftime('%d.%m.%Y %H:%M')
+            })
+        
+        return bank_rates
+        
+    except Error as e:
+        print(f"Ошибка получения банковских курсов из БД: {e}")
+        return None
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
+
+init_database()
+
+def fetch_exchange_rates():
+    db_rates = get_exchange_rates_from_db()
+    if db_rates:
+        print("Используются курсы из БД")
+        exchange_rates_cache['rates'] = db_rates
+        exchange_rates_cache['timestamp'] = time.time()
+        return db_rates
+    
+    print("Получение курсов из API")
     try:
         response = requests.get(f'{BASE_URL}{API_KEY}/latest/USD')
         data = response.json()
@@ -67,6 +338,7 @@ def fetch_exchange_rates():
 
             exchange_rates_cache['rates'] = all_rates
             exchange_rates_cache['timestamp'] = time.time()
+            save_exchange_rates_to_db(all_rates)
             return all_rates
     except Exception as e:
         print(f"Ошибка при получении курсов: {e}")
@@ -113,13 +385,12 @@ def fetch_direct_historical_range(from_curr, to_curr, days=7):
         return None, None
 
 def fetch_historical_range(from_curr, to_curr, days=7):
-    cache_key = f"{from_curr}_{to_curr}_{days}"
+    db_rates, db_dates = get_historical_rates_from_db(from_curr, to_curr, days)
+    if db_rates and db_dates:
+        print(f"Используются исторические данные из БД для {from_curr}/{to_curr}")
+        return db_rates, db_dates
     
-    if cache_key in historical_cache:
-        cached_data = historical_cache[cache_key]
-        if time.time() - cached_data['timestamp'] < 3600:
-            return cached_data['rates'], cached_data['dates']
-
+    print(f"Получение исторических данных из API для {from_curr}/{to_curr}")
     rates, dates = fetch_direct_historical_range(from_curr, to_curr, days)
 
     if rates is None and from_curr != 'USD' and to_curr != 'USD':
@@ -139,22 +410,7 @@ def fetch_historical_range(from_curr, to_curr, days=7):
                     rates.append(cross_rate)
 
     if rates is not None:
-        current_rate = exchange_rates_cache['rates'].get(from_curr, {}).get(to_curr)
-        today = datetime.now().date()
-        
-        if current_rate and (not dates or dates[0] != today):
-            dates.insert(0, today)
-            rates.insert(0, current_rate)
-            if len(dates) > days:
-                dates = dates[:days]
-                rates = rates[:days]
-
-    if rates is not None:
-        historical_cache[cache_key] = {
-            'rates': rates,
-            'dates': dates,
-            'timestamp': time.time()
-        }
+        save_historical_rates_to_db(from_curr, to_curr, rates, dates)
         return rates, dates
     
     return None, None
@@ -226,7 +482,6 @@ def generate_exchange_chart(from_curr, to_curr):
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
-
     exchange_rates = fetch_exchange_rates()
     
     if not exchange_rates:
@@ -251,7 +506,14 @@ def index():
     update_time = datetime.now().strftime('%d.%m.%Y %H:%M')
 
     target_currency = from_currency if from_currency in ['USD', 'EUR'] else 'USD'
-    banks = get_bank_rates(target_currency)
+    
+    banks = get_bank_rates_from_db(target_currency)
+    
+    if not banks:
+        banks = get_bank_rates(target_currency)
+        if banks:
+            save_bank_rates_to_db(banks)
+    
     if not banks:
         banks = [{
             'name': 'Данные временно недоступны',
@@ -260,7 +522,6 @@ def index():
             'updated': '-',
             'currency': target_currency
         }]
-
 
     return render_template(
         'index.html',
