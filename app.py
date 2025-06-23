@@ -432,7 +432,7 @@ def generate_exchange_chart(from_curr, to_curr):
             rates[i] = rates[i-1] * (1 + change)
 
         rates[-1] = base_rate
-        chart_title = f'Имитация курса {from_curr}/{to_curr} (реальные данные недоступны)'
+        chart_title = f'Имитация курса {from_curr}/{to_curr}'
 
     plt.figure(figsize=(10, 6))
     plt.plot(dates, rates, marker='o', linestyle='-', color='#1F2261', 
